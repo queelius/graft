@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "graft"
+version = "0.1.0"
+description = "Ground LLMs with corpus-based n-gram models via mixture probability"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Alexander Towell", email = "lex@metafunctor.com" }]
+keywords = ["llm", "language-model", "infinigram", "grounding", "rag", "mixture-of-experts"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "py-infinigram>=0.7",
+    "numpy>=1.19",
+    "fastapi>=0.104",
+    "uvicorn[standard]>=0.24",
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+transformers = [
+    "transformers>=4.40",
+    "torch>=2.0",
+    "accelerate>=0.20",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+
+[project.scripts]
+graft-serve = "graft.cli:main"
+
+[project.urls]
+"Source" = "https://github.com/queelius/graft"
+"Bug Reports" = "https://github.com/queelius/graft/issues"
+
+[tool.setuptools.packages.find]
+include = ["graft*"]
+exclude = ["tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+addopts = "-v --strict-markers --tb=short"
