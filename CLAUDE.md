@@ -21,6 +21,8 @@ infinigram itself is the model + your data; `graft` is the LLM-mixture-and-serve
 pytest tests/                 # all tests (no LLM/torch needed; uses FakeLLM)
 pytest tests/ -v
 pytest tests/test_mixture.py  # single file
+pytest tests/ -k linear_mix   # single test by keyword
+pytest tests/ --cov=graft     # coverage (pytest-cov is in [dev])
 ```
 
 ### Development
@@ -29,6 +31,7 @@ pytest tests/test_mixture.py  # single file
 pip install -e .[dev]             # core + tests
 pip install -e .[transformers,dev]  # add HF Transformers adapter
 graft-serve --llm gpt2 --infinigram /path/to/index --port 8000
+graft-serve --config server.yaml  # alternative: YAML config (see server/config.py)
 ```
 
 ## Architecture
@@ -69,6 +72,20 @@ infinigram MUST use the same tokenizer. `generate_grounded` raises
 
 This means: pick the LLM first, then build the infinigram with its tokenizer.
 
+### Pipeline early exits
+
+`generate_grounded` has two fast paths that bypass mixture entirely
+(`pipeline.py`):
+
+- `inf.continuations(context) is None` → no suffix match in corpus, return
+  `p_llm` directly. `alpha_fn` is **not called**.
+- `alpha_fn(match_length) <= 0.0` → mixture skipped, return `p_llm` directly.
+  `mixture_fn` is **not called**.
+
+Stop tokens are **stripped** from the returned token list when matched (the
+match suffix is trimmed). Callers comparing expected vs. actual should not
+expect the stop sequence in the output.
+
 ### LLMClient protocol
 
 Anything implementing this works as an LLM backend:
@@ -100,6 +117,19 @@ Two strategies live in `graft.mixture`:
 For grounding (which is the project's purpose), linear is the right default.
 Geometric exists for cases where you want agreement-only / terminology
 enforcement / distillation-style behavior.
+
+## Server contract
+
+- `make_app(llm, inf, hf_tokenizer)` (`server/api.py`) closes over a single
+  LLM + infinigram pair for the process lifetime. No per-request model
+  selection.
+- The REST API exposes a **strict subset** of pipeline alpha strategies:
+  `alpha_strategy` accepts only `"constant"` or `"sigmoid"`. The `step`
+  strategy from `graft.alpha` is library-only; surfacing it requires
+  extending `_resolve_alpha` in `server/api.py`.
+- Heavy imports (`torch`, `transformers`, `uvicorn`) are deferred to
+  `__init__` / `main()` bodies, so `graft-serve --help` and importing
+  `graft.llm.transformers` do not require torch.
 
 ## Test strategy
 
