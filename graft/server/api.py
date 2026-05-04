@@ -6,16 +6,17 @@ generation pipeline. Synchronous (no streaming in v1).
 
 import time
 import uuid
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from infinigram import Infinigram
 
-from graft.alpha import AlphaFn, constant, sigmoid_on_length
+from graft.alpha import AlphaFn, constant, sigmoid_on_length, step
 from graft.llm.base import LLMClient
-from graft.pipeline import generate_grounded
+from graft.mixture import geometric_mix, linear_mix
+from graft.pipeline import MixtureFn, generate_grounded
 
 
 class CompletionRequest(BaseModel):
@@ -25,12 +26,23 @@ class CompletionRequest(BaseModel):
     max_tokens: int = 100
     temperature: float = 1.0
 
-    # Mixture controls.
+    # Alpha (corpus weight) controls.
     alpha: float = Field(0.3, description="Constant alpha (used when alpha_strategy='constant')")
-    alpha_strategy: str = Field("constant", description="'constant' | 'sigmoid'")
+    alpha_strategy: str = Field("constant", description="'constant' | 'sigmoid' | 'step'")
     sigmoid_midpoint: float = 4.0
     sigmoid_steepness: float = 1.0
     sigmoid_max_alpha: float = 0.7
+    step_thresholds: Optional[List[Tuple[int, float]]] = Field(
+        None,
+        description="(min_match_length, alpha) pairs; required when alpha_strategy='step'",
+    )
+
+    # Mixture controls.
+    mixture_strategy: str = Field("linear", description="'linear' (MoE) | 'geometric' (PoE)")
+    geometric_smoothing: float = Field(
+        1e-8,
+        description="Pseudo-count for tokens missing from a side under geometric mixture",
+    )
 
     stop: Optional[List[str]] = None
 
@@ -55,7 +67,30 @@ def _resolve_alpha(req: CompletionRequest) -> AlphaFn:
             steepness=req.sigmoid_steepness,
             max_alpha=req.sigmoid_max_alpha,
         )
+    if req.alpha_strategy == "step":
+        if not req.step_thresholds:
+            raise HTTPException(
+                status_code=400,
+                detail="alpha_strategy='step' requires step_thresholds",
+            )
+        return step(req.step_thresholds)
     raise HTTPException(status_code=400, detail=f"Unknown alpha_strategy: {req.alpha_strategy}")
+
+
+def _resolve_mixture(req: CompletionRequest) -> MixtureFn:
+    if req.mixture_strategy == "linear":
+        return linear_mix
+    if req.mixture_strategy == "geometric":
+        smoothing = req.geometric_smoothing
+
+        def fn(p_llm: Dict[int, float], p_inf: Dict[int, float], alpha: float) -> Dict[int, float]:
+            return geometric_mix(p_llm, p_inf, alpha, smoothing=smoothing)
+
+        return fn
+    raise HTTPException(
+        status_code=400,
+        detail=f"Unknown mixture_strategy: {req.mixture_strategy}",
+    )
 
 
 def make_app(llm: LLMClient, inf: Infinigram, hf_tokenizer) -> FastAPI:
@@ -85,6 +120,7 @@ def make_app(llm: LLMClient, inf: Infinigram, hf_tokenizer) -> FastAPI:
             prompt_tokens = list(req.prompt)
 
         alpha_fn = _resolve_alpha(req)
+        mixture_fn = _resolve_mixture(req)
 
         # Tokenize stop sequences (if any).
         stop_tokens = None
@@ -99,6 +135,7 @@ def make_app(llm: LLMClient, inf: Infinigram, hf_tokenizer) -> FastAPI:
             max_tokens=req.max_tokens,
             temperature=req.temperature,
             alpha_fn=alpha_fn,
+            mixture_fn=mixture_fn,
             stop_tokens=stop_tokens,
         )
         elapsed_ms = (time.perf_counter() - start) * 1000.0
@@ -116,6 +153,7 @@ def make_app(llm: LLMClient, inf: Infinigram, hf_tokenizer) -> FastAPI:
                 "tokens_per_sec": round(len(tokens) / (elapsed_ms / 1000.0), 2) if elapsed_ms > 0 else None,
                 "n_generated": len(tokens),
                 "alpha_strategy": req.alpha_strategy,
+                "mixture_strategy": req.mixture_strategy,
                 "prompt_tokens": len(prompt_tokens),
             },
         )
