@@ -3,20 +3,50 @@
 Loads any causal LM from the Hub (or a local path), exposes its full
 next-token distribution. Suitable for research / experimentation; for
 production-grade throughput, use a vLLM adapter (TODO).
+
+Reuses the model's KV cache between calls when the new context strictly
+extends the previous one (the common case during a single generation).
+This collapses an O(n^2) sequence of forward passes to one prefill plus
+n single-token forwards.
 """
 
-from typing import Dict, List, Optional
+import threading
+from typing import Dict, List, Optional, Tuple
+
+
+def _cache_split(
+    context: List[int],
+    cached_context: Optional[List[int]],
+) -> Tuple[bool, List[int]]:
+    """Decide whether to reuse the KV cache or do a full re-forward.
+
+    Returns ``(extends_cache, tokens_to_forward)``.
+
+    - ``extends_cache=True``: ``cached_context`` is a strict prefix of
+      ``context``; only the new suffix needs to be forwarded.
+    - ``extends_cache=False``: cache miss; ``tokens_to_forward`` is the
+      full ``context`` (callers should discard the cache).
+
+    Equal contexts return ``(False, context)`` because forwarding 0 new
+    tokens against the existing cache cannot produce a logits row at the
+    new position.
+    """
+    if (
+        cached_context
+        and len(context) > len(cached_context)
+        and context[: len(cached_context)] == cached_context
+    ):
+        return True, context[len(cached_context):]
+    return False, context
 
 
 class TransformersClient:
     """HF Transformers in-process adapter for the LLMClient protocol.
 
-    Holds the model and tokenizer in this process. Each call to
-    next_token_logprobs runs a full forward pass on the context.
-
-    For interactive grounding use, prefer small models (Llama 3.2 1B,
-    Qwen 2.5 1.5B, GPT-2 small) on a GPU. For larger models, latency per
-    token is dominated by the model forward pass, not the infinigram lookup.
+    Holds the model, tokenizer, and a KV cache in this process. Forward
+    passes are serialized through an internal lock so concurrent requests
+    on a long-lived server (e.g. via FastAPI's threadpool) cannot corrupt
+    cache state.
     """
 
     def __init__(
@@ -49,12 +79,17 @@ class TransformersClient:
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
         self.model.to(self.device)
-        # Set inference mode (no dropout, no grad). Equivalent to .eval().
+        # Inference mode: no dropout, no grad accumulation.
         self.model.train(False)
 
         # Stash these on self so other code can use them without re-importing torch.
         self._torch = torch
         self._vocab_size = int(self.model.config.vocab_size)
+
+        # KV-cache state, guarded by _lock.
+        self._cached_context: Optional[List[int]] = None
+        self._past_key_values = None
+        self._lock = threading.Lock()
 
     @property
     def vocab_size(self) -> int:
@@ -63,6 +98,17 @@ class TransformersClient:
     def tokenizer_id(self) -> str:
         return self.model_name
 
+    def reset_cache(self) -> None:
+        """Discard the KV cache.
+
+        Call between unrelated generation contexts. Not required for
+        correctness (divergent contexts auto-trigger a cache miss) but
+        can free GPU memory between large generations.
+        """
+        with self._lock:
+            self._cached_context = None
+            self._past_key_values = None
+
     def next_token_logprobs(self, context: List[int]) -> Dict[int, float]:
         """Run the model and return the full next-token log-probability dict.
 
@@ -70,20 +116,31 @@ class TransformersClient:
         is fine for typical models but worth knowing for very large vocabularies.
         """
         torch = self._torch
+
+        # Resolve effective context (BOS / 0 for empty).
         if not context:
-            # No context: feed BOS (or 0 if there is no BOS token) so the
-            # forward pass runs on something well-defined.
             bos = self.tokenizer.bos_token_id
-            input_ids = torch.tensor([[bos if bos is not None else 0]], device=self.device)
+            effective_context = [bos if bos is not None else 0]
         else:
-            input_ids = torch.tensor([list(context)], device=self.device)
+            effective_context = list(context)
 
-        with torch.no_grad():
-            outputs = self.model(input_ids)
-            logits = outputs.logits[0, -1, :]
-            log_probs = torch.log_softmax(logits, dim=-1)
+        with self._lock:
+            extends, to_forward = _cache_split(effective_context, self._cached_context)
+            past = self._past_key_values if extends else None
 
-        # Materialize as a Python dict. For very large vocabularies this is
-        # the expensive part of the per-token loop; future optimization could
-        # keep things as tensors all the way through the mixture.
-        return {i: float(lp) for i, lp in enumerate(log_probs.cpu().tolist())}
+            input_ids = torch.tensor([to_forward], device=self.device)
+            with torch.no_grad():
+                outputs = self.model(
+                    input_ids,
+                    past_key_values=past,
+                    use_cache=True,
+                )
+                logits = outputs.logits[0, -1, :]
+                log_probs = torch.log_softmax(logits, dim=-1)
+
+            self._cached_context = effective_context
+            self._past_key_values = outputs.past_key_values
+
+            result = {i: float(lp) for i, lp in enumerate(log_probs.cpu().tolist())}
+
+        return result
