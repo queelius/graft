@@ -95,28 +95,30 @@ class TestEndToEnd:
         assert len(text) > 0
 
     def test_corpus_dominates_at_alpha_one(self, stack):
-        """alpha=1.0 with a known-in-corpus prompt should follow the corpus.
+        """alpha=1.0 + greedy must reduce to argmax of the infinigram's
+        continuation counts at the longest matching suffix.
 
-        For the prompt "the quick brown" (verbatim in CORPUS_TEXT), the
-        next corpus continuation is " fox". With alpha=1.0 (greedy), the
-        first generated token must come from the infinigram's continuation
-        distribution, not the (undertrained) tiny-gpt2 fallback.
+        Computes that argmax independently from inf.continuations(prompt)
+        and compares against the pipeline output, so the assertion does
+        not depend on how the LLM's tokenizer happens to encode any
+        particular surface form.
         """
         llm, inf = stack
         prompt = llm.tokenizer.encode("the quick brown")
+
+        counts = inf.continuations(prompt)
+        assert counts is not None, "in-corpus prefix should have continuations"
+        expected = max(counts.items(), key=lambda kv: kv[1])[0]
+
         tokens = generate_grounded(
             prompt=prompt,
             llm=llm,
             inf=inf,
-            max_tokens=2,
+            max_tokens=1,
             temperature=0.0,
             alpha_fn=constant(1.0),
         )
-        # Ground truth: in the corpus, "the quick brown" is always followed
-        # by " fox". The greedy argmax of the infinigram's continuation
-        # distribution must be the " fox" token.
-        expected_next = llm.tokenizer.encode(" fox")[0]
-        assert tokens[0] == expected_next
+        assert tokens[0] == expected
 
     def test_alpha_zero_matches_bare_llm_argmax(self, stack):
         """With alpha=0, the pipeline must reduce to LLM-only sampling.

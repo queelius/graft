@@ -31,39 +31,46 @@ def _max_abs_diff(a: dict, b: dict) -> float:
 
 
 class TestKvCacheCorrectness:
+    @pytest.fixture(autouse=True)
+    def _reset(self, client):
+        """Reset the module-scoped client's cache before every test so order
+        is irrelevant and new tests can't accidentally inherit prior state."""
+        client.reset_cache()
+
     def test_extension_matches_reset_recompute(self, client):
         """Extending the context via cache produces the same logits as
         recomputing from scratch with the cache reset."""
-        client.reset_cache()
-        # Prime cache with [10, 20, 30].
         _ = client.next_token_logprobs([10, 20, 30])
-        # Extend by one token; this hits the cache path.
         cached = client.next_token_logprobs([10, 20, 30, 40])
 
-        # Now reset and recompute from scratch.
         client.reset_cache()
         fresh = client.next_token_logprobs([10, 20, 30, 40])
 
         assert _max_abs_diff(cached, fresh) < 1e-5
 
     def test_long_extension_matches_reset_recompute(self, client):
-        """Several consecutive extensions all stay numerically equivalent."""
-        client.reset_cache()
+        """Several consecutive extensions all stay numerically equivalent.
+
+        Two-pass: first build the cached chain so each step extends from
+        the prior cache (the property under test); then reset between
+        each fresh recompute. Functionally identical to instantiating a
+        new client per step, but avoids reloading the model four times.
+        """
+        cached_results = {}
         ctx = [5, 7, 11, 13]
         _ = client.next_token_logprobs(ctx)
         for tok in [17, 19, 23, 29]:
             ctx = ctx + [tok]
-            cached = client.next_token_logprobs(ctx)
+            cached_results[tuple(ctx)] = client.next_token_logprobs(ctx)
 
-            client_reset = TransformersClient(TINY_MODEL, device="cpu")
-            fresh = client_reset.next_token_logprobs(ctx)
+        for ctx_tuple, cached in cached_results.items():
+            client.reset_cache()
+            fresh = client.next_token_logprobs(list(ctx_tuple))
             assert _max_abs_diff(cached, fresh) < 1e-5
 
     def test_divergence_triggers_full_recompute(self, client):
         """A diverged context must re-forward and produce correct logits."""
-        client.reset_cache()
         _ = client.next_token_logprobs([10, 20, 30])
-        # Diverge: prefix doesn't match.
         diverged = client.next_token_logprobs([99, 88, 77])
 
         client.reset_cache()
@@ -73,7 +80,6 @@ class TestKvCacheCorrectness:
 
     def test_reset_cache_isolates_state(self, client):
         """After reset_cache, internal cache state is None."""
-        client.reset_cache()
         _ = client.next_token_logprobs([1, 2, 3])
         assert client._cached_context is not None
         assert client._past_key_values is not None
@@ -82,15 +88,11 @@ class TestKvCacheCorrectness:
         assert client._past_key_values is None
 
     def test_logprobs_are_valid_distribution(self, client):
-        client.reset_cache()
         lp = client.next_token_logprobs([10, 20, 30])
-        # Probabilities sum to ~1.
         total = sum(math.exp(v) for v in lp.values())
         assert abs(total - 1.0) < 1e-3
 
     def test_empty_context_uses_bos_or_zero(self, client):
-        client.reset_cache()
-        # Should not raise; uses bos_token_id (or 0) under the hood.
         lp = client.next_token_logprobs([])
         assert len(lp) == client.vocab_size
 
@@ -99,13 +101,10 @@ class TestKvCacheCorrectness:
         DynamicCache, internal state must be reset so the next call cannot
         silently read stale KV against a context length that no longer matches.
         """
-        client.reset_cache()
-        # Prime the cache with a valid forward.
         _ = client.next_token_logprobs([1, 2, 3])
         assert client._cached_context is not None
         assert client._past_key_values is not None
 
-        # Force the next forward to raise inside model.forward.
         def boom(*args, **kwargs):
             raise RuntimeError("simulated forward failure")
 
@@ -114,12 +113,9 @@ class TestKvCacheCorrectness:
         with pytest.raises(RuntimeError, match="simulated forward failure"):
             client.next_token_logprobs([1, 2, 3, 4])
 
-        # Cache must be cleared, not left in the partially-mutated state.
         assert client._cached_context is None
         assert client._past_key_values is None
 
-        # Restore the original forward and confirm the lock was released and
-        # the client recovers cleanly.
         monkeypatch.undo()
         lp = client.next_token_logprobs([1, 2, 3, 4])
         assert len(lp) == client.vocab_size
