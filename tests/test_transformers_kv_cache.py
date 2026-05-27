@@ -93,3 +93,33 @@ class TestKvCacheCorrectness:
         # Should not raise; uses bos_token_id (or 0) under the hood.
         lp = client.next_token_logprobs([])
         assert len(lp) == client.vocab_size
+
+    def test_forward_exception_clears_cache(self, client, monkeypatch):
+        """If the forward pass raises after potentially mutating the in-place
+        DynamicCache, internal state must be reset so the next call cannot
+        silently read stale KV against a context length that no longer matches.
+        """
+        client.reset_cache()
+        # Prime the cache with a valid forward.
+        _ = client.next_token_logprobs([1, 2, 3])
+        assert client._cached_context is not None
+        assert client._past_key_values is not None
+
+        # Force the next forward to raise inside model.forward.
+        def boom(*args, **kwargs):
+            raise RuntimeError("simulated forward failure")
+
+        monkeypatch.setattr(client.model, "forward", boom)
+
+        with pytest.raises(RuntimeError, match="simulated forward failure"):
+            client.next_token_logprobs([1, 2, 3, 4])
+
+        # Cache must be cleared, not left in the partially-mutated state.
+        assert client._cached_context is None
+        assert client._past_key_values is None
+
+        # Restore the original forward and confirm the lock was released and
+        # the client recovers cleanly.
+        monkeypatch.undo()
+        lp = client.next_token_logprobs([1, 2, 3, 4])
+        assert len(lp) == client.vocab_size

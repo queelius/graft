@@ -129,14 +129,22 @@ class TransformersClient:
             past = self._past_key_values if extends else None
 
             input_ids = torch.tensor([to_forward], device=self.device)
-            with torch.no_grad():
-                outputs = self.model(
-                    input_ids,
-                    past_key_values=past,
-                    use_cache=True,
-                )
-                logits = outputs.logits[0, -1, :]
-                log_probs = torch.log_softmax(logits, dim=-1)
+            try:
+                with torch.no_grad():
+                    outputs = self.model(
+                        input_ids,
+                        past_key_values=past,
+                        use_cache=True,
+                    )
+                    logits = outputs.logits[0, -1, :]
+                    log_probs = torch.log_softmax(logits, dim=-1)
+            except BaseException:
+                # HF's DynamicCache mutates in place; a partial forward that
+                # raises leaves the cache out of sync with _cached_context.
+                # Discard both so the next call cannot silently read stale KV.
+                self._cached_context = None
+                self._past_key_values = None
+                raise
 
             self._cached_context = effective_context
             self._past_key_values = outputs.past_key_values
