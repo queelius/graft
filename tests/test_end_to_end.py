@@ -11,7 +11,6 @@ Skipped when torch / transformers are not installed.
 """
 
 import math
-import shutil
 import tempfile
 from pathlib import Path
 
@@ -47,9 +46,8 @@ def stack():
     Module-scoped: model load + index build are both done once.
     """
     llm = TransformersClient(TINY_MODEL, device="cpu")
-    tmpdir = tempfile.mkdtemp(prefix="graft-e2e-")
-    index_path = Path(tmpdir) / "index"
-    try:
+    with tempfile.TemporaryDirectory(prefix="graft-e2e-") as tmpdir:
+        index_path = Path(tmpdir) / "index"
         Infinigram.build(
             CORPUS_TEXT,
             str(index_path),
@@ -58,8 +56,6 @@ def stack():
         )
         inf = Infinigram.load(str(index_path), tokenizer=llm.tokenizer)
         yield llm, inf
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 class TestEndToEnd:

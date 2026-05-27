@@ -7,8 +7,7 @@ These exercise:
        HF model is required.
 """
 
-import math
-from typing import Dict, List
+from typing import List
 
 import pytest
 from fastapi import HTTPException
@@ -18,27 +17,7 @@ from infinigram import Infinigram
 from graft.mixture import geometric_mix, linear_mix
 from graft.server.api import _resolve_alpha, _resolve_mixture, make_app
 from graft.server.api import CompletionRequest
-
-
-class FakeLLM:
-    """Same shape as tests/test_pipeline.py's FakeLLM (byte-vocab, deterministic)."""
-
-    def __init__(self, vocab_size: int = 256, distribution: Dict[int, float] = None):
-        self._vocab_size = vocab_size
-        if distribution is None:
-            distribution = {i: 1.0 / vocab_size for i in range(vocab_size)}
-        z = sum(distribution.values())
-        self._logprobs = {v: math.log(p / z) for v, p in distribution.items() if p > 0}
-
-    @property
-    def vocab_size(self) -> int:
-        return self._vocab_size
-
-    def tokenizer_id(self) -> str:
-        return "fake"
-
-    def next_token_logprobs(self, context: List[int]) -> Dict[int, float]:
-        return dict(self._logprobs)
+from tests.conftest import FakeLLM
 
 
 class FakeTokenizer:

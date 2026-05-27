@@ -6,7 +6,8 @@ generation pipeline. Synchronous (no streaming in v1).
 
 import time
 import uuid
-from typing import Dict, List, Optional, Tuple, Union
+from functools import partial
+from typing import List, Optional, Tuple, Union
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -81,12 +82,7 @@ def _resolve_mixture(req: CompletionRequest) -> MixtureFn:
     if req.mixture_strategy == "linear":
         return linear_mix
     if req.mixture_strategy == "geometric":
-        smoothing = req.geometric_smoothing
-
-        def fn(p_llm: Dict[int, float], p_inf: Dict[int, float], alpha: float) -> Dict[int, float]:
-            return geometric_mix(p_llm, p_inf, alpha, smoothing=smoothing)
-
-        return fn
+        return partial(geometric_mix, smoothing=req.geometric_smoothing)
     raise HTTPException(
         status_code=400,
         detail=f"Unknown mixture_strategy: {req.mixture_strategy}",
