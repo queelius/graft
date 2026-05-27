@@ -230,3 +230,38 @@ class TestHttpSurface:
             },
         )
         assert r.status_code == 400
+
+
+class TestRequestValidation:
+    """Schema-level validation: out-of-range values return 422 from Pydantic."""
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"alpha": 1.5},
+            {"alpha": -0.1},
+            {"temperature": -0.1},
+            {"max_tokens": 0},
+            {"max_tokens": 100_000},
+            {"sigmoid_steepness": 0.0},
+            {"sigmoid_steepness": -1.0},
+            {"sigmoid_max_alpha": 1.5},
+            {"sigmoid_max_alpha": -0.1},
+            {"geometric_smoothing": 0.0},
+            {"geometric_smoothing": -1.0},
+            {"step_thresholds": []},
+        ],
+    )
+    def test_out_of_range_returns_422(self, client, payload):
+        body = {"prompt": "the ", "max_tokens": 1, **payload}
+        r = client.post("/v1/completions", json=body)
+        assert r.status_code == 422, f"expected 422 for {payload}, got {r.status_code}: {r.text}"
+
+    def test_step_thresholds_none_still_400(self, client):
+        """Conditional rule (step requires thresholds) stays at 400, not 422,
+        because Pydantic can't express it as a schema constraint."""
+        r = client.post(
+            "/v1/completions",
+            json={"prompt": "the ", "max_tokens": 1, "alpha_strategy": "step"},
+        )
+        assert r.status_code == 400

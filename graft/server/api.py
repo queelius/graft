@@ -21,20 +21,28 @@ from graft.pipeline import MixtureFn, generate_grounded
 
 
 class CompletionRequest(BaseModel):
-    """Request body for ``POST /v1/completions``."""
+    """Request body for ``POST /v1/completions``.
+
+    Numeric ranges are enforced at the schema layer (Pydantic), so out-of-range
+    requests return 422 with a descriptive body instead of leaking 500s from the
+    underlying alpha/mixture factories. Conditional rules like
+    "step_thresholds required when alpha_strategy='step'" stay in
+    ``_resolve_alpha`` and return 400.
+    """
 
     prompt: Union[str, List[int]] = Field(..., description="Text or pre-tokenized ids")
-    max_tokens: int = 100
-    temperature: float = 1.0
+    max_tokens: int = Field(100, ge=1, le=8192)
+    temperature: float = Field(1.0, ge=0.0)
 
     # Alpha (corpus weight) controls.
-    alpha: float = Field(0.3, description="Constant alpha (used when alpha_strategy='constant')")
+    alpha: float = Field(0.3, ge=0.0, le=1.0, description="Constant alpha (used when alpha_strategy='constant')")
     alpha_strategy: str = Field("constant", description="'constant' | 'sigmoid' | 'step'")
     sigmoid_midpoint: float = 4.0
-    sigmoid_steepness: float = 1.0
-    sigmoid_max_alpha: float = 0.7
+    sigmoid_steepness: float = Field(1.0, gt=0.0)
+    sigmoid_max_alpha: float = Field(0.7, ge=0.0, le=1.0)
     step_thresholds: Optional[List[Tuple[int, float]]] = Field(
         None,
+        min_length=1,
         description="(min_match_length, alpha) pairs; required when alpha_strategy='step'",
     )
 
@@ -42,6 +50,7 @@ class CompletionRequest(BaseModel):
     mixture_strategy: str = Field("linear", description="'linear' (MoE) | 'geometric' (PoE)")
     geometric_smoothing: float = Field(
         1e-8,
+        gt=0.0,
         description="Pseudo-count for tokens missing from a side under geometric mixture",
     )
 
@@ -69,7 +78,7 @@ def _resolve_alpha(req: CompletionRequest) -> AlphaFn:
             max_alpha=req.sigmoid_max_alpha,
         )
     if req.alpha_strategy == "step":
-        if not req.step_thresholds:
+        if req.step_thresholds is None:
             raise HTTPException(
                 status_code=400,
                 detail="alpha_strategy='step' requires step_thresholds",
@@ -99,7 +108,7 @@ def make_app(llm: LLMClient, inf: Infinigram, hf_tokenizer) -> FastAPI:
     app = FastAPI(title="graft", version="0.1.0")
 
     @app.get("/health")
-    async def health() -> dict:
+    def health() -> dict:
         return {
             "status": "ok",
             "llm": llm.tokenizer_id(),
@@ -107,8 +116,11 @@ def make_app(llm: LLMClient, inf: Infinigram, hf_tokenizer) -> FastAPI:
             "infinigram_n": inf.n,
         }
 
+    # Sync handler: FastAPI dispatches to its threadpool so the blocking
+    # forward pass does not stall the event loop (and /health stays
+    # responsive during generation).
     @app.post("/v1/completions", response_model=CompletionResponse)
-    async def completions(req: CompletionRequest) -> CompletionResponse:
+    def completions(req: CompletionRequest) -> CompletionResponse:
         # Tokenize prompt.
         if isinstance(req.prompt, str):
             prompt_tokens = list(hf_tokenizer.encode(req.prompt))
